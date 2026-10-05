@@ -109,16 +109,19 @@ func decodeArtifactInput(body io.Reader) (artifactInput, error) {
 	return input, nil
 }
 
+// The required* helpers decode into pointers so an explicit JSON null lands on
+// a nil pointer and is rejected like a missing field, instead of silently
+// becoming the zero value ("", false, 0).
 func requiredString(raw map[string]json.RawMessage, name string) (string, error) {
 	field, ok := raw[name]
 	if !ok {
 		return "", errInvalidInput
 	}
-	var value string
-	if err := json.Unmarshal(field, &value); err != nil {
+	var value *string
+	if err := json.Unmarshal(field, &value); err != nil || value == nil {
 		return "", errInvalidInput
 	}
-	return value, nil
+	return *value, nil
 }
 
 func requiredBool(raw map[string]json.RawMessage, name string) (bool, error) {
@@ -126,11 +129,11 @@ func requiredBool(raw map[string]json.RawMessage, name string) (bool, error) {
 	if !ok {
 		return false, errInvalidInput
 	}
-	var value bool
-	if err := json.Unmarshal(field, &value); err != nil {
+	var value *bool
+	if err := json.Unmarshal(field, &value); err != nil || value == nil {
 		return false, errInvalidInput
 	}
-	return value, nil
+	return *value, nil
 }
 
 // requiredInt rejects fractional, exponential and string forms because
@@ -140,11 +143,11 @@ func requiredInt(raw map[string]json.RawMessage, name string) (int64, error) {
 	if !ok {
 		return 0, errInvalidInput
 	}
-	var value int64
-	if err := json.Unmarshal(field, &value); err != nil {
+	var value *int64
+	if err := json.Unmarshal(field, &value); err != nil || value == nil {
 		return 0, errInvalidInput
 	}
-	return value, nil
+	return *value, nil
 }
 
 func registerArtifact(svc *service.Service) gin.HandlerFunc {

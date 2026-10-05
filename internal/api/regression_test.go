@@ -130,6 +130,237 @@ func queryList(t *testing.T, router *gin.Engine, repo string) *httptest.Response
 	return getArtifacts(t, router, "repository="+repo)
 }
 
+// boundaryRepo is the repository the null/empty-boundary regression tests use.
+const boundaryRepo = "registry-demo/boundary"
+
+// requiredFieldNames lists the six required registration fields in their
+// canonical order, so encoded bodies are deterministic.
+var requiredFieldNames = []string{
+	"repository", "digest", "tag", "signature_verified", "retention_days", "size_bytes",
+}
+
+// boundaryFields returns one valid registration as raw JSON values, ready for
+// tests to delete or null out individual fields.
+func boundaryFields() map[string]string {
+	return map[string]string{
+		"repository":         fmt.Sprintf("%q", boundaryRepo),
+		"digest":             fmt.Sprintf("%q", testDigestA),
+		"tag":                fmt.Sprintf("%q", sequenceTag),
+		"signature_verified": "true",
+		"retention_days":     "30",
+		"size_bytes":         "1024",
+	}
+}
+
+func encodeFields(t *testing.T, fields map[string]string) string {
+	t.Helper()
+	parts := make([]string, 0, len(fields))
+	for _, name := range requiredFieldNames {
+		if value, ok := fields[name]; ok {
+			parts = append(parts, fmt.Sprintf("%q:%s", name, value))
+		}
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// TestRegistrationRejectsMissingAndNullRequiredFields pins the published
+// boundary: each of the six required fields answers 400 with
+// InvalidArtifactInputError whether it is absent or explicitly JSON null, and
+// the rejection never leaves a record behind.
+func TestRegistrationRejectsMissingAndNullRequiredFields(t *testing.T) {
+	for _, field := range requiredFieldNames {
+		for _, variant := range []string{"missing", "null"} {
+			t.Run(field+"/"+variant, func(t *testing.T) {
+				router, _ := newTestRouter(t)
+				fields := boundaryFields()
+				if variant == "missing" {
+					delete(fields, field)
+				} else {
+					fields[field] = "null"
+				}
+				assertErrorResponse(t, postArtifact(t, router, encodeFields(t, fields)),
+					http.StatusBadRequest, codeInvalidInput, msgInvalidReg)
+
+				// The rejection left no record behind.
+				assertErrorResponse(t, queryList(t, router, boundaryRepo),
+					http.StatusNotFound, codeNotFound, msgNotFound)
+			})
+		}
+	}
+}
+
+// TestRegistrationAcceptsLegitimateFalseAndZero pins the other side of the
+// null boundary: a real false and a real 0 are legal values, not to be
+// confused with null, and survive registration, retry and query unchanged.
+func TestRegistrationAcceptsLegitimateFalseAndZero(t *testing.T) {
+	router, _ := newTestRouter(t)
+	fields := boundaryFields()
+	fields["signature_verified"] = "false"
+	fields["size_bytes"] = "0"
+
+	first := postArtifact(t, router, encodeFields(t, fields))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (%s)", first.Code, http.StatusCreated, first.Body)
+	}
+	record := decodeBody(t, first)
+	if record["signature_verified"] != false || record["size_bytes"] != float64(0) {
+		t.Fatalf("false/zero were not preserved: %v", record)
+	}
+	pushedAt, _ := record["pushed_at"].(string)
+	if pushedAt == "" {
+		t.Fatalf("response has no pushed_at: %v", record)
+	}
+
+	// An identical retry returns 201 with the original record and timestamp.
+	retry := postArtifact(t, router, encodeFields(t, fields))
+	if retry.Code != http.StatusCreated {
+		t.Fatalf("retry status = %d, want %d (%s)", retry.Code, http.StatusCreated, retry.Body)
+	}
+	if got := decodeBody(t, retry)["pushed_at"]; got != pushedAt {
+		t.Fatalf("retry pushed_at = %v, want original %v", got, pushedAt)
+	}
+
+	// The stored record keeps false and 0 through the query entry as well.
+	stored := soleRecord(t, queryByDigest(t, router, boundaryRepo, testDigestA))
+	if stored["signature_verified"] != false || stored["size_bytes"] != float64(0) {
+		t.Fatalf("stored record lost false/zero: %v", stored)
+	}
+	if stored["pushed_at"] != pushedAt {
+		t.Fatalf("stored pushed_at = %v, want %v", stored["pushed_at"], pushedAt)
+	}
+}
+
+// TestRejectedRegistrationLeavesCommittedStateUntouched registers A and B so
+// the tag points at B, then fires invalid bodies that carry A's existing
+// identity — some also with different content. Validation must answer 400
+// before identity or conflict logic runs, so a 409 is never reachable, and
+// neither the records, the timestamps nor the tag pointer may change.
+func TestRejectedRegistrationLeavesCommittedStateUntouched(t *testing.T) {
+	router, _ := newTestRouter(t)
+
+	first := postArtifact(t, router, registration(boundaryRepo, testDigestA, sequenceTag, true, regRetention, regSizeA))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("register A status = %d (%s)", first.Code, first.Body)
+	}
+	pushedA, _ := decodeBody(t, first)["pushed_at"].(string)
+	if rec := postArtifact(t, router, registration(boundaryRepo, testDigestB, sequenceTag, true, regRetention, regSizeB)); rec.Code != http.StatusCreated {
+		t.Fatalf("register B status = %d (%s)", rec.Code, rec.Body)
+	}
+
+	invalidOnExistingIdentity := map[string]func(map[string]string){
+		"null signature on existing identity": func(f map[string]string) { f["signature_verified"] = "null" },
+		"null size on existing identity":      func(f map[string]string) { f["size_bytes"] = "null" },
+		"missing tag on existing identity":    func(f map[string]string) { delete(f, "tag") },
+		"null retention with changed content": func(f map[string]string) {
+			f["retention_days"] = "null"
+			f["size_bytes"] = "2048"
+		},
+		"missing digest": func(f map[string]string) { delete(f, "digest") },
+	}
+	for name, mutate := range invalidOnExistingIdentity {
+		t.Run(name, func(t *testing.T) {
+			fields := boundaryFields()
+			mutate(fields)
+			recorder := postArtifact(t, router, encodeFields(t, fields))
+			if recorder.Code == http.StatusConflict {
+				t.Fatalf("invalid input reached conflict logic: %s", recorder.Body)
+			}
+			assertErrorResponse(t, recorder, http.StatusBadRequest, codeInvalidInput, msgInvalidReg)
+
+			// The original A record is byte-for-byte the same through the API.
+			expectStoredRecord(t, soleRecord(t, queryByDigest(t, router, boundaryRepo, testDigestA)),
+				boundaryRepo, testDigestA, sequenceTag, true,
+				float64(regRetention), float64(regSizeA), pushedA)
+
+			// The tag pointer still resolves to B.
+			if got := soleRecord(t, queryByTag(t, router, boundaryRepo, sequenceTag)); got["digest"] != testDigestB {
+				t.Fatalf("tag pointer moved after rejection: %v, want %s", got["digest"], testDigestB)
+			}
+
+			// No third record appeared and registration order is unchanged.
+			if digests := recordDigests(allRecords(t, queryList(t, router, boundaryRepo))); len(digests) != 2 ||
+				digests[0] != testDigestA || digests[1] != testDigestB {
+				t.Fatalf("list changed after rejection: %v", digests)
+			}
+		})
+	}
+}
+
+// TestQueryEmptyValueBoundaries pins the published query boundary: only an
+// omitted tag/digest yields the repository list; an explicitly empty or
+// whitespace-only value, a bare parameter name, or tag and digest together —
+// empty or not — all answer the same 400 InvalidArtifactInputError instead of
+// degrading into a list or single-condition query.
+func TestQueryEmptyValueBoundaries(t *testing.T) {
+	router, _ := newTestRouter(t)
+	if rec := postArtifact(t, router, registration(boundaryRepo, testDigestA, sequenceTag, true, regRetention, regSizeA)); rec.Code != http.StatusCreated {
+		t.Fatalf("seed register status = %d (%s)", rec.Code, rec.Body)
+	}
+
+	for name, query := range map[string]string{
+		"tag empty":              "repository=" + boundaryRepo + "&tag=",
+		"tag bare":               "repository=" + boundaryRepo + "&tag",
+		"tag blank whitespace":   "repository=" + boundaryRepo + "&tag=%20%20",
+		"digest empty":           "repository=" + boundaryRepo + "&digest=",
+		"digest bare":            "repository=" + boundaryRepo + "&digest",
+		"tag and digest empty":   "repository=" + boundaryRepo + "&tag=&digest=",
+		"tag empty digest valid": "repository=" + boundaryRepo + "&tag=&digest=" + testDigestA,
+		"tag valid digest empty": "repository=" + boundaryRepo + "&tag=" + sequenceTag + "&digest=",
+		"tag and digest valid":   "repository=" + boundaryRepo + "&tag=" + sequenceTag + "&digest=" + testDigestA,
+		"repository empty":       "repository=",
+		"repository blank":       "repository=%20%20",
+		"repository missing":     "tag=" + sequenceTag,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertErrorResponse(t, getArtifacts(t, router, query),
+				http.StatusBadRequest, codeInvalidInput, msgInvalidQuery)
+		})
+	}
+
+	// Only a bare repository lists every record of the repository.
+	if digests := recordDigests(allRecords(t, queryList(t, router, boundaryRepo))); len(digests) != 1 ||
+		digests[0] != testDigestA {
+		t.Fatalf("repository list = %v, want [%s]", digests, testDigestA)
+	}
+
+	// Legal single-condition queries still hit, and misses still answer 404.
+	if got := soleRecord(t, queryByTag(t, router, boundaryRepo, sequenceTag)); got["digest"] != testDigestA {
+		t.Fatalf("tag query = %v, want digest %s", got, testDigestA)
+	}
+	assertErrorResponse(t, queryByTag(t, router, boundaryRepo, "missing-tag"),
+		http.StatusNotFound, codeNotFound, msgNotFound)
+	assertErrorResponse(t, queryByDigest(t, router, boundaryRepo, testDigestB),
+		http.StatusNotFound, codeNotFound, msgNotFound)
+}
+
+// TestStorageUnavailableStillValidatesInput closes the store and checks that
+// illegal input is still rejected with 400 before the storage layer is
+// touched, while legal requests surface the outage as 503 storage_unavailable.
+func TestStorageUnavailableStillValidatesInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	router := NewRouter(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	fields := boundaryFields()
+	fields["signature_verified"] = "null"
+	assertErrorResponse(t, postArtifact(t, router, encodeFields(t, fields)),
+		http.StatusBadRequest, codeInvalidInput, msgInvalidReg)
+	assertErrorResponse(t, getArtifacts(t, router, "repository="+boundaryRepo+"&tag="),
+		http.StatusBadRequest, codeInvalidInput, msgInvalidQuery)
+
+	assertErrorResponse(t, postArtifact(t, router,
+		registration(boundaryRepo, testDigestA, sequenceTag, true, regRetention, regSizeA)),
+		http.StatusServiceUnavailable, codeStorage, msgStorage)
+	assertErrorResponse(t, queryList(t, router, boundaryRepo),
+		http.StatusServiceUnavailable, codeStorage, msgStorage)
+}
+
 // TestRegistrationSequenceIdentityAndTagPointer walks the full scenario:
 // register A, register B under the same tag, retry A verbatim, then mutate each
 // comparable field of A. The immutable registration record and the mutable tag

@@ -109,9 +109,17 @@ func decodeArtifactInput(body io.Reader) (artifactInput, error) {
 	return input, nil
 }
 
+// isJSONNull reports an explicit JSON null. encoding/json unmarshals null
+// into any Go value without an error and leaves the zero value behind, which
+// would silently turn a null signature_verified into false and a null
+// size_bytes into 0; a required field must reject null like a missing key.
+func isJSONNull(field json.RawMessage) bool {
+	return string(field) == "null"
+}
+
 func requiredString(raw map[string]json.RawMessage, name string) (string, error) {
 	field, ok := raw[name]
-	if !ok {
+	if !ok || isJSONNull(field) {
 		return "", errInvalidInput
 	}
 	var value string
@@ -123,7 +131,7 @@ func requiredString(raw map[string]json.RawMessage, name string) (string, error)
 
 func requiredBool(raw map[string]json.RawMessage, name string) (bool, error) {
 	field, ok := raw[name]
-	if !ok {
+	if !ok || isJSONNull(field) {
 		return false, errInvalidInput
 	}
 	var value bool
@@ -137,7 +145,7 @@ func requiredBool(raw map[string]json.RawMessage, name string) (bool, error) {
 // encoding/json refuses to unmarshal them into an integer.
 func requiredInt(raw map[string]json.RawMessage, name string) (int64, error) {
 	field, ok := raw[name]
-	if !ok {
+	if !ok || isJSONNull(field) {
 		return 0, errInvalidInput
 	}
 	var value int64

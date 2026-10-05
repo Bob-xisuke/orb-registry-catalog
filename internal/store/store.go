@@ -1,4 +1,7 @@
-// Package store owns the SQLite file and every write the service performs.
+// Package store is the SQLite-backed adapter for the service.Store port. It
+// owns the SQLite file and every write the service performs, but defines no
+// business data types of its own: records, register statuses and the
+// not-found sentinel all come from the service storage contract.
 package store
 
 import (
@@ -6,8 +9,13 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Bob-xisuke/orb-registry-catalog/internal/service"
+
 	_ "modernc.org/sqlite"
 )
+
+// Compile-time assertion that *Store is a service.Store.
+var _ service.Store = (*Store)(nil)
 
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
@@ -37,92 +45,65 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Artifact is a single registered record. PushedAt is assigned by the service at
-// first registration and never changes afterwards.
-type Artifact struct {
-	Repository        string
-	Digest            string
-	Tag               string
-	SignatureVerified bool
-	RetentionDays     int64
-	SizeBytes         int64
-	PushedAt          string
-}
+const recordColumns = `repository, digest, tag, signature_verified, retention_days, size_bytes, pushed_at`
 
-// ErrNotFound reports that a lookup matched no record.
-var ErrNotFound = errors.New("store: no matching record")
-
-// RegisterOutcome describes how a RegisterArtifact call resolved.
-type RegisterOutcome int
-
-const (
-	// RegisterCreated means the record was newly written and its tag pointer moved.
-	RegisterCreated RegisterOutcome = iota
-	// RegisterDuplicate means identical content already existed; nothing was written.
-	RegisterDuplicate
-	// RegisterConflict means the (repository, digest) identity exists with different content.
-	RegisterConflict
-)
-
-const artifactColumns = `repository, digest, tag, signature_verified, retention_days, size_bytes, pushed_at`
-
-// RegisterArtifact writes a new artifact and moves its tag pointer in a single
+// Register writes a new artifact and moves its tag pointer in a single
 // transaction, so readers only ever see both changes or neither. Re-submitting
 // identical content returns the stored record without moving the tag pointer;
 // different content for an existing (repository, digest) is a conflict.
-func (s *Store) RegisterArtifact(a Artifact) (Artifact, RegisterOutcome, error) {
+func (s *Store) Register(a service.Record) (service.Record, service.RegisterStatus, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return Artifact{}, 0, fmt.Errorf("begin register: %w", err)
+		return service.Record{}, 0, fmt.Errorf("begin register: %w", err)
 	}
 	defer tx.Rollback()
 
-	existing, err := scanArtifact(tx.QueryRow(
-		`SELECT `+artifactColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+	existing, err := scanRecord(tx.QueryRow(
+		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
 		a.Repository, a.Digest))
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, service.ErrRecordNotFound):
 		if _, err := tx.Exec(
-			`INSERT INTO artifacts (`+artifactColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO artifacts (`+recordColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			a.Repository, a.Digest, a.Tag, a.SignatureVerified,
 			a.RetentionDays, a.SizeBytes, a.PushedAt); err != nil {
-			return Artifact{}, 0, fmt.Errorf("insert artifact: %w", err)
+			return service.Record{}, 0, fmt.Errorf("insert artifact: %w", err)
 		}
 		if _, err := tx.Exec(
 			`INSERT INTO tag_pointers (repository, tag, digest) VALUES (?, ?, ?)
 			 ON CONFLICT (repository, tag) DO UPDATE SET digest = excluded.digest`,
 			a.Repository, a.Tag, a.Digest); err != nil {
-			return Artifact{}, 0, fmt.Errorf("move tag pointer: %w", err)
+			return service.Record{}, 0, fmt.Errorf("move tag pointer: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return Artifact{}, 0, fmt.Errorf("commit register: %w", err)
+			return service.Record{}, 0, fmt.Errorf("commit register: %w", err)
 		}
-		return a, RegisterCreated, nil
+		return a, service.StatusCreated, nil
 	case err != nil:
-		return Artifact{}, 0, fmt.Errorf("lookup artifact: %w", err)
+		return service.Record{}, 0, fmt.Errorf("lookup artifact: %w", err)
 	}
 
 	if existing.Tag == a.Tag &&
 		existing.SignatureVerified == a.SignatureVerified &&
 		existing.RetentionDays == a.RetentionDays &&
 		existing.SizeBytes == a.SizeBytes {
-		return existing, RegisterDuplicate, nil
+		return existing, service.StatusDuplicate, nil
 	}
-	return Artifact{}, RegisterConflict, nil
+	return service.Record{}, service.StatusConflict, nil
 }
 
-// ListArtifacts returns every record for a repository in first-registration order.
-func (s *Store) ListArtifacts(repository string) ([]Artifact, error) {
+// ListRecords returns every record for a repository in first-registration order.
+func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 	rows, err := s.db.Query(
-		`SELECT `+artifactColumns+` FROM artifacts WHERE repository = ? ORDER BY id`, repository)
+		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? ORDER BY id`, repository)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}
 	defer rows.Close()
 
-	var out []Artifact
+	var out []service.Record
 	for rows.Next() {
-		var a Artifact
+		var a service.Record
 		if err := rows.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
 			&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {
 			return nil, fmt.Errorf("scan artifact: %w", err)
@@ -135,16 +116,16 @@ func (s *Store) ListArtifacts(repository string) ([]Artifact, error) {
 	return out, nil
 }
 
-// ArtifactByDigest returns the record for an exact (repository, digest) identity.
-func (s *Store) ArtifactByDigest(repository, digest string) (Artifact, error) {
-	return scanArtifact(s.db.QueryRow(
-		`SELECT `+artifactColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+// RecordByDigest returns the record for an exact (repository, digest) identity.
+func (s *Store) RecordByDigest(repository, digest string) (service.Record, error) {
+	return scanRecord(s.db.QueryRow(
+		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
 		repository, digest))
 }
 
-// ArtifactByTag resolves the current tag pointer to the record it references.
-func (s *Store) ArtifactByTag(repository, tag string) (Artifact, error) {
-	return scanArtifact(s.db.QueryRow(
+// RecordByTag resolves the current tag pointer to the record it references.
+func (s *Store) RecordByTag(repository, tag string) (service.Record, error) {
+	return scanRecord(s.db.QueryRow(
 		`SELECT a.repository, a.digest, a.tag, a.signature_verified,
 		        a.retention_days, a.size_bytes, a.pushed_at
 		 FROM tag_pointers p
@@ -152,14 +133,14 @@ func (s *Store) ArtifactByTag(repository, tag string) (Artifact, error) {
 		 WHERE p.repository = ? AND p.tag = ?`, repository, tag))
 }
 
-func scanArtifact(row *sql.Row) (Artifact, error) {
-	var a Artifact
+func scanRecord(row *sql.Row) (service.Record, error) {
+	var a service.Record
 	if err := row.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
 		&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return Artifact{}, ErrNotFound
+			return service.Record{}, service.ErrRecordNotFound
 		}
-		return Artifact{}, err
+		return service.Record{}, err
 	}
 	return a, nil
 }

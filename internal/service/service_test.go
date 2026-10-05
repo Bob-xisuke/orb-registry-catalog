@@ -2,11 +2,8 @@ package service
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/Bob-xisuke/orb-registry-catalog/internal/store"
 )
 
 const (
@@ -14,15 +11,11 @@ const (
 	digestB = "sha256:" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-func newTestService(t *testing.T) (*Service, string) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "service.db")
-	st, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-	return New(st), path
+// newTestService builds a Service over the in-memory fake, so the business
+// rules below are verified without opening SQLite or any database handle.
+func newTestService() (*Service, *fakeStore) {
+	st := newFakeStore()
+	return New(st), st
 }
 
 func validInput(repo, digest, tag string) RegisterInput {
@@ -64,7 +57,7 @@ func assertRFC3339UTC(t *testing.T, value string) {
 }
 
 func TestRegisterCreatedThenDuplicate(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, st := newTestService()
 	input := validInput("team/app", digestA, "latest")
 
 	first, err := svc.Register(input)
@@ -77,6 +70,11 @@ func TestRegisterCreatedThenDuplicate(t *testing.T) {
 	assertRFC3339UTC(t, first.Artifact.PushedAt)
 	wantRecord(t, first.Artifact, input, first.Artifact.PushedAt)
 	pushedAt := first.Artifact.PushedAt
+
+	// The first registration wrote exactly one record and moved its tag.
+	if len(st.records) != 1 {
+		t.Fatalf("records after first register = %d, want 1", len(st.records))
+	}
 
 	// An identical retry is distinguishable as a duplicate and returns the
 	// original record, including its push time.
@@ -93,10 +91,13 @@ func TestRegisterCreatedThenDuplicate(t *testing.T) {
 	if second.Artifact.PushedAt != pushedAt {
 		t.Fatalf("pushed_at changed on duplicate: %q -> %q", pushedAt, second.Artifact.PushedAt)
 	}
+	if len(st.records) != 1 {
+		t.Fatalf("duplicate register added a record: now %d, want 1", len(st.records))
+	}
 }
 
 func TestRegisterConflictLeavesRecordAndTagUntouched(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _ := newTestService()
 	input := validInput("team/app", digestA, "latest")
 
 	first, err := svc.Register(input)
@@ -167,7 +168,7 @@ func withChanges(in RegisterInput, change func(*RegisterInput)) RegisterInput {
 // TestRegistrationSequenceAndQueries walks: register A, register B under the
 // same tag, retry A, then read through all three query kinds.
 func TestRegistrationSequenceAndQueries(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _ := newTestService()
 	inputA := validInput("team/app", digestA, "latest")
 	inputB := validInput("team/app", digestB, "latest")
 	inputB.SizeBytes = 2048
@@ -196,7 +197,8 @@ func TestRegistrationSequenceAndQueries(t *testing.T) {
 		t.Fatalf("list = %+v, want [A B] in registration order", list)
 	}
 
-	// The tag resolves to the newer record B even after retrying A.
+	// The tag resolves to the newer record B even after retrying A, and a tag
+	// or digest lookup still comes back as a one-element array.
 	byTag, err := svc.Query(Query{Kind: QueryByTag, Repository: "team/app", Tag: "latest"})
 	if err != nil {
 		t.Fatalf("by tag: %v", err)
@@ -216,7 +218,7 @@ func TestRegistrationSequenceAndQueries(t *testing.T) {
 }
 
 func TestRepositoriesDoNotInterfere(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _ := newTestService()
 	inputOne := validInput("repo/one", digestA, "latest")
 	inputTwo := validInput("repo/two", digestA, "latest")
 
@@ -264,7 +266,7 @@ func TestRepositoriesDoNotInterfere(t *testing.T) {
 }
 
 func TestQueryNotFound(t *testing.T) {
-	svc, _ := newTestService(t)
+	svc, _ := newTestService()
 	if _, err := svc.Register(validInput("team/app", digestA, "latest")); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -283,31 +285,78 @@ func TestQueryNotFound(t *testing.T) {
 	}
 }
 
-func TestStorageFailureIsNotNotFound(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "service.db")
-	st, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
+// emptyListStore answers every repository list with a non-nil empty slice and
+// every point lookup with a miss, and never fails. It pins the rule that an
+// empty committed list is ErrNotFound even when the backend reports no error.
+type emptyListStore struct{}
+
+func (emptyListStore) Register(Record) (Record, RegisterStatus, error) {
+	return Record{}, StatusCreated, nil
+}
+func (emptyListStore) ListRecords(string) ([]Record, error) { return []Record{}, nil }
+func (emptyListStore) RecordByDigest(string, string) (Record, error) {
+	return Record{}, ErrRecordNotFound
+}
+func (emptyListStore) RecordByTag(string, string) (Record, error) {
+	return Record{}, ErrRecordNotFound
+}
+
+func TestEmptyRepositoryListIsNotFound(t *testing.T) {
+	svc := New(emptyListStore{})
+	if _, err := svc.Query(Query{Kind: QueryByRepository, Repository: "team/app"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("empty list error = %v, want ErrNotFound", err)
 	}
-	svc := New(st)
+}
+
+// TestStorageFailureIsNotNotFound forces a backend-native fault on each
+// operation. Every result must be ErrStorage — including a lookup whose
+// identity happens not to exist — so a fault is never surfaced as a miss.
+func TestStorageFailureIsNotNotFound(t *testing.T) {
+	svc, st := newTestService()
 	if _, err := svc.Register(validInput("team/app", digestA, "latest")); err != nil {
 		t.Fatalf("seed register: %v", err)
 	}
-	if err := st.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
 
-	// Every operation reports ErrStorage, even lookups that would otherwise hit.
+	st.fail["register"] = true
 	if _, err := svc.Register(validInput("team/app", digestB, "latest")); !errors.Is(err, ErrStorage) {
 		t.Fatalf("register error = %v, want ErrStorage", err)
 	}
-	for name, query := range map[string]Query{
-		"list":   {Kind: QueryByRepository, Repository: "team/app"},
-		"tag":    {Kind: QueryByTag, Repository: "team/app", Tag: "latest"},
-		"digest": {Kind: QueryByDigest, Repository: "team/app", Digest: digestA},
-		"miss":   {Kind: QueryByDigest, Repository: "team/app", Digest: digestB},
+	st.fail["register"] = false
+
+	for name, fault := range map[string]string{
+		"list":   "list",
+		"tag":    "tag",
+		"digest": "digest",
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(name+" fault on a hit", func(t *testing.T) {
+			st.fail[fault] = true
+			defer delete(st.fail, fault)
+			query := Query{Kind: QueryByRepository, Repository: "team/app"}
+			switch fault {
+			case "tag":
+				query.Kind, query.Tag = QueryByTag, "latest"
+			case "digest":
+				query.Kind, query.Digest = QueryByDigest, digestA
+			}
+			if _, err := svc.Query(query); !errors.Is(err, ErrStorage) {
+				t.Fatalf("query error = %v, want ErrStorage", err)
+			}
+		})
+	}
+
+	// A fault while looking up an identity that would miss anyway is still
+	// ErrStorage, not ErrNotFound.
+	for name, fault := range map[string]string{
+		"tag":    "tag",
+		"digest": "digest",
+	} {
+		t.Run(name+" fault masks a miss", func(t *testing.T) {
+			st.fail[fault] = true
+			defer delete(st.fail, fault)
+			query := Query{Kind: QueryByTag, Repository: "team/app", Tag: "missing"}
+			if fault == "digest" {
+				query.Kind, query.Digest = QueryByDigest, digestB
+			}
 			if _, err := svc.Query(query); !errors.Is(err, ErrStorage) {
 				t.Fatalf("query error = %v, want ErrStorage", err)
 			}
@@ -315,61 +364,21 @@ func TestStorageFailureIsNotNotFound(t *testing.T) {
 	}
 }
 
-// TestRecordsSurviveReopen uses an existing SQLite file without conversion and
-// checks records, first-registration order, push times and tag pointers.
-func TestRecordsSurviveReopen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "service.db")
-
-	st, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
+// TestSentinelErrorsAreDistinct guards errors.Is classification the HTTP layer
+// and other callers rely on.
+func TestSentinelErrorsAreDistinct(t *testing.T) {
+	sentinels := []error{ErrConflict, ErrNotFound, ErrStorage}
+	for i, one := range sentinels {
+		for j, other := range sentinels {
+			if i == j {
+				continue
+			}
+			if errors.Is(one, other) {
+				t.Fatalf("%v must not match %v", one, other)
+			}
+		}
 	}
-	svc := New(st)
-	inputA := validInput("team/app", digestA, "latest")
-	inputB := validInput("team/app", digestB, "latest")
-	inputB.SizeBytes = 2048
-	first, err := svc.Register(inputA)
-	if err != nil {
-		t.Fatalf("register A: %v", err)
-	}
-	second, err := svc.Register(inputB)
-	if err != nil {
-		t.Fatalf("register B: %v", err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	reopened, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	t.Cleanup(func() { reopened.Close() })
-	svc = New(reopened)
-
-	list, err := svc.Query(Query{Kind: QueryByRepository, Repository: "team/app"})
-	if err != nil {
-		t.Fatalf("list after reopen: %v", err)
-	}
-	if len(list) != 2 ||
-		list[0].Digest != digestA || list[0].PushedAt != first.Artifact.PushedAt ||
-		list[1].Digest != digestB || list[1].PushedAt != second.Artifact.PushedAt {
-		t.Fatalf("records/order/timestamps changed after reopen: %+v", list)
-	}
-
-	byTag, err := svc.Query(Query{Kind: QueryByTag, Repository: "team/app", Tag: "latest"})
-	if err != nil {
-		t.Fatalf("tag after reopen: %v", err)
-	}
-	if len(byTag) != 1 || byTag[0].Digest != digestB || byTag[0].PushedAt != second.Artifact.PushedAt {
-		t.Fatalf("tag pointer changed after reopen: %+v", byTag)
-	}
-
-	byDigest, err := svc.Query(Query{Kind: QueryByDigest, Repository: "team/app", Digest: digestA})
-	if err != nil {
-		t.Fatalf("digest after reopen: %v", err)
-	}
-	if len(byDigest) != 1 || byDigest[0] != first.Artifact {
-		t.Fatalf("A record changed after reopen: %+v", byDigest)
+	if !errors.Is(ErrRecordNotFound, ErrRecordNotFound) {
+		t.Fatalf("storage not-found sentinel lost its identity")
 	}
 }

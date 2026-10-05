@@ -9,6 +9,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -311,6 +312,92 @@ func TestAssemblyEntryUnknownRoute(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/missing", nil))
 	assertErrorResponse(t, recorder, http.StatusNotFound, "route_not_found", "no route matches this path")
+}
+
+// scriptedStore is a minimal service.Store whose register outcome and lookup
+// errors are set directly by the boundary tests, so they can drive storage
+// outcomes the in-memory assemblyStore does not produce: a wrapped miss and
+// a register status returned together with an error.
+type scriptedStore struct {
+	registerStatus service.RegisterStatus
+	registerErr    error
+	lookupErr      error
+}
+
+func (s *scriptedStore) Register(service.Record) (service.Record, service.RegisterStatus, error) {
+	return service.Record{}, s.registerStatus, s.registerErr
+}
+
+func (s *scriptedStore) ListRecords(string) ([]service.Record, error) {
+	return nil, s.lookupErr
+}
+
+func (s *scriptedStore) RecordByDigest(string, string) (service.Record, error) {
+	return service.Record{}, s.lookupErr
+}
+
+func (s *scriptedStore) RecordByTag(string, string) (service.Record, error) {
+	return service.Record{}, s.lookupErr
+}
+
+// TestAssemblyWrappedMissIsNotFound proves the not-found classification
+// survives error wrapping: a store that reports a tag or digest miss as
+// fmt.Errorf("...: %w", service.ErrRecordNotFound) still maps to 404
+// ArtifactNotFoundError, because the service classifies with errors.Is
+// rather than comparing the error value.
+func TestAssemblyWrappedMissIsNotFound(t *testing.T) {
+	st := &scriptedStore{lookupErr: fmt.Errorf("backend lookup: %w", service.ErrRecordNotFound)}
+	router := NewRouterWithStore(st, nil)
+
+	assertErrorResponse(t, queryByTag(t, router, sequenceRepo, "missing"),
+		http.StatusNotFound, codeNotFound, msgNotFound)
+	assertErrorResponse(t, queryByDigest(t, router, sequenceRepo, testDigestA),
+		http.StatusNotFound, codeNotFound, msgNotFound)
+}
+
+// TestAssemblyRegisterStatusWithErrorIsStorage pins the error-first rule on
+// the register path: a store that returns a duplicate or conflict status
+// together with a non-nil error is reported as a storage failure — 503
+// storage_unavailable, never 201 or 409 — because the service checks the
+// error before it looks at the status.
+func TestAssemblyRegisterStatusWithErrorIsStorage(t *testing.T) {
+	statuses := map[string]service.RegisterStatus{
+		"duplicate with error": service.StatusDuplicate,
+		"conflict with error":  service.StatusConflict,
+	}
+	for name, status := range statuses {
+		t.Run(name, func(t *testing.T) {
+			st := &scriptedStore{
+				registerStatus: status,
+				registerErr:    errors.New("scripted backend failure"),
+			}
+			router := NewRouterWithStore(st, nil)
+			assertErrorResponse(t, postArtifact(t, router,
+				registration(sequenceRepo, testDigestA, sequenceTag, true, regRetention, regSizeA)),
+				http.StatusServiceUnavailable, codeStorage, msgStorage)
+		})
+	}
+}
+
+// TestAssemblyNoHealthCheckStoreFailure builds the router without a health
+// check: GET /healthz keeps the published 200 body, while the faulted store
+// alone degrades legal artifact requests to 503 storage_unavailable.
+func TestAssemblyNoHealthCheckStoreFailure(t *testing.T) {
+	st := newAssemblyStore()
+	st.fault = errors.New("assembly backend down")
+	router := NewRouterWithStore(st, nil)
+
+	recorder := getHealth(t, router)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"database":"ok","status":"ok"}` {
+		t.Fatalf("/healthz without a health check = %d %s, want the 200 ok body",
+			recorder.Code, recorder.Body)
+	}
+
+	assertErrorResponse(t, postArtifact(t, router,
+		registration(sequenceRepo, testDigestA, sequenceTag, true, regRetention, regSizeA)),
+		http.StatusServiceUnavailable, codeStorage, msgStorage)
+	assertErrorResponse(t, queryList(t, router, sequenceRepo),
+		http.StatusServiceUnavailable, codeStorage, msgStorage)
 }
 
 // TestSQLiteEntryStaysCompatibleWithExistingData writes records through the

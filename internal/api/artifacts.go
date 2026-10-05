@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Bob-xisuke/orb-registry-catalog/internal/service"
 	"github.com/Bob-xisuke/orb-registry-catalog/internal/store"
 )
 
@@ -148,7 +148,7 @@ func requiredInt(raw map[string]json.RawMessage, name string) (int64, error) {
 	return value, nil
 }
 
-func registerArtifact(st *store.Store) gin.HandlerFunc {
+func registerArtifact(svc *service.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		input, err := decodeArtifactInput(c.Request.Body)
 		if err != nil {
@@ -156,28 +156,27 @@ func registerArtifact(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		record, outcome, err := st.RegisterArtifact(store.Artifact{
+		result, err := svc.Register(store.Artifact{
 			Repository:        input.repository,
 			Digest:            input.digest,
 			Tag:               input.tag,
 			SignatureVerified: input.signatureVerified,
 			RetentionDays:     input.retentionDays,
 			SizeBytes:         input.sizeBytes,
-			PushedAt:          time.Now().UTC().Format(time.RFC3339),
 		})
-		if err != nil {
-			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")
-			return
-		}
-		if outcome == store.RegisterConflict {
+		switch {
+		case errors.Is(err, service.ErrConflict):
 			writeError(c, http.StatusConflict, codeConflict, "an artifact with this repository and digest already exists with different content")
-			return
+		case err != nil:
+			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")
+		default:
+			// First registration and identical retry both answer 201.
+			c.JSON(http.StatusCreated, artifactResponse(result.Artifact))
 		}
-		c.JSON(http.StatusCreated, artifactResponse(record))
 	}
 }
 
-func queryArtifacts(st *store.Store) gin.HandlerFunc {
+func queryArtifacts(svc *service.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		repository := strings.TrimSpace(c.Query("repository"))
 		tag, hasTag := c.GetQuery("tag")
@@ -190,27 +189,16 @@ func queryArtifacts(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		var (
-			artifacts []store.Artifact
-			err       error
-		)
-		switch {
-		case hasTag:
-			var record store.Artifact
-			if record, err = st.ArtifactByTag(repository, tag); err == nil {
-				artifacts = []store.Artifact{record}
-			}
-		case hasDigest:
-			var record store.Artifact
-			if record, err = st.ArtifactByDigest(repository, digest); err == nil {
-				artifacts = []store.Artifact{record}
-			}
-		default:
-			artifacts, err = st.ListArtifacts(repository)
+		lookup := service.Query{Repository: repository}
+		if hasTag {
+			lookup.Tag = tag
+		} else if hasDigest {
+			lookup.Digest = digest
 		}
+		artifacts, err := svc.Query(lookup)
 
 		switch {
-		case errors.Is(err, store.ErrNotFound), err == nil && len(artifacts) == 0:
+		case errors.Is(err, service.ErrNotFound):
 			writeError(c, http.StatusNotFound, codeNotFound, "no artifact matches this query")
 		case err != nil:
 			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")

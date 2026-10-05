@@ -7,11 +7,10 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Bob-xisuke/orb-registry-catalog/internal/store"
+	"github.com/Bob-xisuke/orb-registry-catalog/internal/service"
 )
 
 const (
@@ -40,7 +39,7 @@ func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
 }
 
-func artifactResponse(a store.Artifact) gin.H {
+func artifactResponse(a service.Artifact) gin.H {
 	return gin.H{
 		"repository":         a.Repository,
 		"digest":             a.Digest,
@@ -148,7 +147,7 @@ func requiredInt(raw map[string]json.RawMessage, name string) (int64, error) {
 	return value, nil
 }
 
-func registerArtifact(st *store.Store) gin.HandlerFunc {
+func registerArtifact(svc *service.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		input, err := decodeArtifactInput(c.Request.Body)
 		if err != nil {
@@ -156,28 +155,28 @@ func registerArtifact(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		record, outcome, err := st.RegisterArtifact(store.Artifact{
+		result, err := svc.Register(service.RegisterInput{
 			Repository:        input.repository,
 			Digest:            input.digest,
 			Tag:               input.tag,
 			SignatureVerified: input.signatureVerified,
 			RetentionDays:     input.retentionDays,
 			SizeBytes:         input.sizeBytes,
-			PushedAt:          time.Now().UTC().Format(time.RFC3339),
 		})
-		if err != nil {
-			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")
-			return
-		}
-		if outcome == store.RegisterConflict {
+		switch {
+		case errors.Is(err, service.ErrConflict):
 			writeError(c, http.StatusConflict, codeConflict, "an artifact with this repository and digest already exists with different content")
-			return
+		case err != nil:
+			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")
+		default:
+			// First registrations and identical retries share the public 201;
+			// the created/duplicate distinction stays inside the service result.
+			c.JSON(http.StatusCreated, artifactResponse(result.Artifact))
 		}
-		c.JSON(http.StatusCreated, artifactResponse(record))
 	}
 }
 
-func queryArtifacts(st *store.Store) gin.HandlerFunc {
+func queryArtifacts(svc *service.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		repository := strings.TrimSpace(c.Query("repository"))
 		tag, hasTag := c.GetQuery("tag")
@@ -190,27 +189,21 @@ func queryArtifacts(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		var (
-			artifacts []store.Artifact
-			err       error
-		)
+		query := service.Query{Repository: repository}
 		switch {
 		case hasTag:
-			var record store.Artifact
-			if record, err = st.ArtifactByTag(repository, tag); err == nil {
-				artifacts = []store.Artifact{record}
-			}
+			query.Kind = service.QueryByTag
+			query.Tag = tag
 		case hasDigest:
-			var record store.Artifact
-			if record, err = st.ArtifactByDigest(repository, digest); err == nil {
-				artifacts = []store.Artifact{record}
-			}
+			query.Kind = service.QueryByDigest
+			query.Digest = digest
 		default:
-			artifacts, err = st.ListArtifacts(repository)
+			query.Kind = service.QueryByRepository
 		}
 
+		artifacts, err := svc.Query(query)
 		switch {
-		case errors.Is(err, store.ErrNotFound), err == nil && len(artifacts) == 0:
+		case errors.Is(err, service.ErrNotFound):
 			writeError(c, http.StatusNotFound, codeNotFound, "no artifact matches this query")
 		case err != nil:
 			writeError(c, http.StatusServiceUnavailable, codeStorage, "database is not available")

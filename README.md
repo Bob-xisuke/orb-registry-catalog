@@ -38,6 +38,34 @@ go run .
 {"error":{"code":"storage_unavailable","message":"database is not available"}}
 ```
 
+### `POST /v1/artifacts`
+
+登记一个制品。请求体是单个 JSON 对象，必填字段：`repository`、`digest`、`tag`、`signature_verified`、`retention_days`、`size_bytes`，未知字段忽略。校验规则：
+
+- `repository`、`tag`：去除首尾空白后非空，区分大小写
+- `digest`：`sha256:` 加 64 位小写十六进制字符
+- `signature_verified`：布尔值
+- `retention_days`：1 至 3650 的整数（仅登记，不触发自动删除）
+- `size_bytes`：非负有符号 64 位整数
+
+首次登记返回 HTTP 201，响应为六个登记字段及服务生成的 `pushed_at`（UTC，RFC3339）。记录以 `(repository, digest)` 为唯一身份，登记后不可修改：
+
+- 规范化后内容完全相同的重复提交返回 201 和原记录，`pushed_at` 不变，标签指向不变
+- 内容不同返回 HTTP 409 与 `ArtifactConflictError`
+- 不同摘要复用同一标签时，标签指向新记录，旧记录仍可按摘要查询
+
+输入非法时返回 HTTP 400 与 `InvalidArtifactInputError`，不留下任何记录。
+
+### `GET /v1/artifacts`
+
+查询制品。`repository` 必填，`tag` 与 `digest` 可选其一、不能同时提供，参数沿用登记校验规则：
+
+- 仅 `repository`：返回该仓库全部记录，按首次登记先后排列
+- 加 `tag`：返回该标签当前指向的记录
+- 加 `digest`：返回对应记录
+
+成功时 HTTP 200，响应为 `{"artifacts":[...]}`。参数非法返回 HTTP 400 与 `InvalidArtifactInputError`；合法查询无结果返回 HTTP 404 与 `ArtifactNotFoundError`。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。

@@ -18,7 +18,7 @@ func TestHealthzReportsOK(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	NewRouter(st).ServeHTTP(recorder, request)
+	NewRouterWithHealth(st, st.Ping).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)

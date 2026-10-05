@@ -22,6 +22,15 @@ go run .
 | `ADDR` | `127.0.0.1:8080` | HTTP 监听地址 |
 | `DB_PATH` | `orb-registry-catalog.db` | SQLite 数据库文件路径 |
 
+## 路由装配入口
+
+HTTP 层只依赖业务层的存储契约 `service.Store`，路由构造不打开数据库，也不关闭调用方传入的存储：
+
+- `api.NewRouter(st service.Store) *gin.Engine`：只装配制品入口。自备存储只需满足 `service.Store`（`Register`、`ListRecords`、`RecordByDigest`、`RecordByTag`），不必实现 `Ping`，也不必使用 SQLite 或 `database/sql`；此时不提供 `GET /healthz`（与其他未知路径一样返回 `route_not_found`）。
+- `api.NewRouterWithHealth(st service.Store, check api.HealthChecker) *gin.Engine`：在同样的制品入口之外，额外以调用方提供的 `func() error` 装配 `GET /healthz`，每次检查只依据该函数的返回值，成功为 nil、失败为任意 error。健康检查与制品登记/查询互不前置：检查失败不阻断仍可成功的制品请求，存储故障也不替代检查结果。
+
+`NewRouter` 的既有调用方式保持可用；默认启动仍按 `ADDR` 与 `DB_PATH` 打开 SQLite，并以 `st.Ping` 作为健康检查，数据库句柄由 `main.go` 自行关闭。
+
 ## 已公开的入口
 
 ### `GET /healthz`

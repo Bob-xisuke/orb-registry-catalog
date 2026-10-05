@@ -25,7 +25,9 @@ func main() {
 	}
 	defer st.Close()
 
-	if err := api.NewRouter(st).Run(address); err != nil {
+	// The SQLite store owns its own lifecycle; the router only receives the
+	// storage port plus the independent health probe, and never closes either.
+	if err := api.NewRouterWithHealth(st, st.Ping).Run(address); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }

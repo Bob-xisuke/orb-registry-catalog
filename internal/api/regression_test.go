@@ -310,7 +310,7 @@ func TestStorageUnavailableReturns503(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	router := NewRouter(st)
+	router := NewRouterWithHealth(st, st.Ping)
 	if recorder := postArtifact(t, router,
 		registration(sequenceRepo, testDigestA, sequenceTag, true, regRetention, regSizeA)); recorder.Code != http.StatusCreated {
 		t.Fatalf("seed register status = %d (%s)", recorder.Code, recorder.Body)
@@ -574,6 +574,7 @@ func TestStorageUnavailableStillValidatesInput(t *testing.T) {
 	assertErrorResponse(t, queryList(t, router, sequenceRepo),
 		http.StatusServiceUnavailable, codeStorage, msgStorage)
 }
+
 // TestRestartPreservesRecordsOrderAndPointers reopens the same database file
 // and checks that immutable records, service-generated timestamps, list order
 // and the current tag pointer all survive.

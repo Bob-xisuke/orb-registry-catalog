@@ -16,7 +16,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
 
-	svc := service.New(st)
+	svc := service.New(newSQLiteStore(st))
 
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {

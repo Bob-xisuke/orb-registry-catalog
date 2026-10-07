@@ -10,6 +10,12 @@
 // duplicate-parameter ordering, '+' versus '%2B', unescaped semicolon and
 // undecodable pair handling) live here and nowhere else.
 //
+// The field rules the two entries share — repository/tag normalization and
+// the digest format — are implemented once each (trimmedName, validDigest)
+// and called from both parsers, so the request body and the query string can
+// never drift apart. Only the transport decoding stays per entry: JSON for
+// the body, percent-decoding for the query string.
+//
 // Every deviation is reported as ErrInvalidInput with a zero result; callers
 // tell the failure apart with errors.Is.
 package input
@@ -38,6 +44,23 @@ var (
 	// clients; callers identify it with errors.Is.
 	ErrInvalidInput = errors.New("invalid artifact input")
 )
+
+// trimmedName is the one repository/tag rule both entries share. It runs on
+// the already-decoded value — JSON string decoding or percent-decoding is
+// the caller's job — drops leading and trailing Unicode whitespace, keeps
+// interior characters and case verbatim, and requires something to remain.
+// The second result carries the non-empty half of the rule so each entry
+// maps a blank name to its own failure.
+func trimmedName(decoded string) (string, bool) {
+	name := strings.TrimSpace(decoded)
+	return name, name != ""
+}
+
+// validDigest is the one digest rule both entries share: the decoded value,
+// never trimmed, must match the anchored format exactly.
+func validDigest(decoded string) bool {
+	return digestPattern.MatchString(decoded)
+}
 
 // ParseRegistration reads exactly one JSON object from r and validates every
 // required field into a service.RegisterInput. Unknown fields are ignored;
@@ -71,7 +94,8 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if in.Repository = strings.TrimSpace(repository); in.Repository == "" {
+	var ok bool
+	if in.Repository, ok = trimmedName(repository); !ok {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 
@@ -79,7 +103,7 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if in.Tag = strings.TrimSpace(tag); in.Tag == "" {
+	if in.Tag, ok = trimmedName(tag); !ok {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 
@@ -87,7 +111,7 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if !digestPattern.MatchString(digest) {
+	if !validDigest(digest) {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 	in.Digest = digest
@@ -179,12 +203,13 @@ func ParseQuery(rawQuery string) (service.Query, error) {
 	// simply absent from the map the same way unknown parameters are.
 	values, _ := url.ParseQuery(rawQuery)
 
-	repository := strings.TrimSpace(values.Get("repository"))
+	repository, repositoryOK := trimmedName(values.Get("repository"))
 	tagValues, hasTag := values["tag"]
 	digestValues, hasDigest := values["digest"]
 	tag := ""
+	tagOK := true
 	if hasTag {
-		tag = strings.TrimSpace(tagValues[0])
+		tag, tagOK = trimmedName(tagValues[0])
 	}
 	// The digest is the first decoded value, untrimmed: an encoded edge
 	// space must keep it outside the anchored format.
@@ -193,8 +218,8 @@ func ParseQuery(rawQuery string) (service.Query, error) {
 		digest = digestValues[0]
 	}
 
-	if repository == "" || (hasTag && hasDigest) ||
-		(hasTag && tag == "") || (hasDigest && !digestPattern.MatchString(digest)) {
+	if !repositoryOK || (hasTag && hasDigest) ||
+		!tagOK || (hasDigest && !validDigest(digest)) {
 		return service.Query{}, ErrInvalidInput
 	}
 

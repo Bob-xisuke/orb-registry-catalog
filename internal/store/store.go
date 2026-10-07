@@ -45,7 +45,24 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-const recordColumns = `repository, digest, tag, signature_verified, retention_days, size_bytes, pushed_at`
+// insertColumns lists the persisted columns in the order a row is written. It
+// stays unqualified because an INSERT column list cannot carry a table alias;
+// the read-side projection lives in artifactColumns.
+const insertColumns = `repository, digest, tag, signature_verified, retention_days, size_bytes, pushed_at`
+
+// artifactColumns is the single read projection for an artifact row. Every
+// read path — the register identity lookup, the repository list and both
+// single-record lookups (tag and digest) — selects exactly these aliased
+// columns in this order, aliasing artifacts as "a". scanRecord below is the
+// only place that maps them onto a service.Record, so field interpretation
+// is defined once instead of once per query.
+const artifactColumns = `a.repository, a.digest, a.tag, a.signature_verified, a.retention_days, a.size_bytes, a.pushed_at`
+
+// rowScanner is the scan surface shared by a single-row (*sql.Row) and a
+// result-set cursor (*sql.Rows), so one scanRecord serves every read path.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
 
 // Register writes a new artifact and moves its tag pointer in a single
 // transaction, so readers only ever see both changes or neither. Re-submitting
@@ -59,12 +76,12 @@ func (s *Store) Register(a service.Record) (service.Record, service.RegisterStat
 	defer tx.Rollback()
 
 	existing, err := scanRecord(tx.QueryRow(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+		`SELECT `+artifactColumns+` FROM artifacts a WHERE a.repository = ? AND a.digest = ?`,
 		a.Repository, a.Digest))
 	switch {
 	case errors.Is(err, service.ErrRecordNotFound):
 		if _, err := tx.Exec(
-			`INSERT INTO artifacts (`+recordColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO artifacts (`+insertColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			a.Repository, a.Digest, a.Tag, a.SignatureVerified,
 			a.RetentionDays, a.SizeBytes, a.PushedAt); err != nil {
 			return service.Record{}, 0, fmt.Errorf("insert artifact: %w", err)
@@ -95,7 +112,7 @@ func (s *Store) Register(a service.Record) (service.Record, service.RegisterStat
 // ListRecords returns every record for a repository in first-registration order.
 func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 	rows, err := s.db.Query(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? ORDER BY id`, repository)
+		`SELECT `+artifactColumns+` FROM artifacts a WHERE a.repository = ? ORDER BY a.id`, repository)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}
@@ -103,10 +120,9 @@ func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 
 	var out []service.Record
 	for rows.Next() {
-		var a service.Record
-		if err := rows.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
-			&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {
-			return nil, fmt.Errorf("scan artifact: %w", err)
+		a, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, a)
 	}
@@ -119,21 +135,25 @@ func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 // RecordByDigest returns the record for an exact (repository, digest) identity.
 func (s *Store) RecordByDigest(repository, digest string) (service.Record, error) {
 	return scanRecord(s.db.QueryRow(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+		`SELECT `+artifactColumns+` FROM artifacts a WHERE a.repository = ? AND a.digest = ?`,
 		repository, digest))
 }
 
 // RecordByTag resolves the current tag pointer to the record it references.
 func (s *Store) RecordByTag(repository, tag string) (service.Record, error) {
 	return scanRecord(s.db.QueryRow(
-		`SELECT a.repository, a.digest, a.tag, a.signature_verified,
-		        a.retention_days, a.size_bytes, a.pushed_at
+		`SELECT `+artifactColumns+`
 		 FROM tag_pointers p
 		 JOIN artifacts a ON a.repository = p.repository AND a.digest = p.digest
 		 WHERE p.repository = ? AND p.tag = ?`, repository, tag))
 }
 
-func scanRecord(row *sql.Row) (service.Record, error) {
+// scanRecord maps the single shared artifact projection onto a service.Record.
+// It is the sole field-scanning rule for every read path, so the register
+// identity lookup and all three queries interpret columns identically. A
+// sql.ErrNoRows row becomes the storage-layer not-found sentinel; every other
+// scan failure is returned unchanged for the caller to treat as a fault.
+func scanRecord(row rowScanner) (service.Record, error) {
 	var a service.Record
 	if err := row.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
 		&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {

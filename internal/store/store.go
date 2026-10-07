@@ -14,6 +14,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// rowScanner is the part of *sql.Row and *sql.Rows that turns the current
+// record into a service.Record. It lets every read share one field map.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 // Compile-time assertion that *Store is a service.Store.
 var _ service.Store = (*Store)(nil)
 
@@ -45,7 +51,16 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// recordColumns lists the persisted fields in INSERT order; it stays
+// unqualified because the INSERT statement names artifacts without an alias.
 const recordColumns = `repository, digest, tag, signature_verified, retention_days, size_bytes, pushed_at`
+
+// recordSelectColumns is the single field map every read projects. It is
+// qualified by the artifacts alias a, so it works identically for a direct
+// lookup and for the tag-pointer join, and every read — the register-time
+// identity lookup, the repository list, the digest lookup and the tag
+// lookup — scans it through the one scanRecord rule below.
+const recordSelectColumns = `a.repository, a.digest, a.tag, a.signature_verified, a.retention_days, a.size_bytes, a.pushed_at`
 
 // Register writes a new artifact and moves its tag pointer in a single
 // transaction, so readers only ever see both changes or neither. Re-submitting
@@ -59,7 +74,7 @@ func (s *Store) Register(a service.Record) (service.Record, service.RegisterStat
 	defer tx.Rollback()
 
 	existing, err := scanRecord(tx.QueryRow(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+		`SELECT `+recordSelectColumns+` FROM artifacts a WHERE a.repository = ? AND a.digest = ?`,
 		a.Repository, a.Digest))
 	switch {
 	case errors.Is(err, service.ErrRecordNotFound):
@@ -95,7 +110,7 @@ func (s *Store) Register(a service.Record) (service.Record, service.RegisterStat
 // ListRecords returns every record for a repository in first-registration order.
 func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 	rows, err := s.db.Query(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? ORDER BY id`, repository)
+		`SELECT `+recordSelectColumns+` FROM artifacts a WHERE a.repository = ? ORDER BY a.id`, repository)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts: %w", err)
 	}
@@ -103,9 +118,8 @@ func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 
 	var out []service.Record
 	for rows.Next() {
-		var a service.Record
-		if err := rows.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
-			&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {
+		a, err := scanRecord(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan artifact: %w", err)
 		}
 		out = append(out, a)
@@ -119,21 +133,24 @@ func (s *Store) ListRecords(repository string) ([]service.Record, error) {
 // RecordByDigest returns the record for an exact (repository, digest) identity.
 func (s *Store) RecordByDigest(repository, digest string) (service.Record, error) {
 	return scanRecord(s.db.QueryRow(
-		`SELECT `+recordColumns+` FROM artifacts WHERE repository = ? AND digest = ?`,
+		`SELECT `+recordSelectColumns+` FROM artifacts a WHERE a.repository = ? AND a.digest = ?`,
 		repository, digest))
 }
 
 // RecordByTag resolves the current tag pointer to the record it references.
 func (s *Store) RecordByTag(repository, tag string) (service.Record, error) {
 	return scanRecord(s.db.QueryRow(
-		`SELECT a.repository, a.digest, a.tag, a.signature_verified,
-		        a.retention_days, a.size_bytes, a.pushed_at
+		`SELECT `+recordSelectColumns+`
 		 FROM tag_pointers p
 		 JOIN artifacts a ON a.repository = p.repository AND a.digest = p.digest
 		 WHERE p.repository = ? AND p.tag = ?`, repository, tag))
 }
 
-func scanRecord(row *sql.Row) (service.Record, error) {
+// scanRecord turns one result row into a service.Record. It takes the
+// rowScanner interface so both *sql.Row and *sql.Rows decode with the same
+// field order recordSelectColumns projects; a backend miss and a backend
+// fault stay distinct through ErrRecordNotFound versus the original error.
+func scanRecord(row rowScanner) (service.Record, error) {
 	var a service.Record
 	if err := row.Scan(&a.Repository, &a.Digest, &a.Tag, &a.SignatureVerified,
 		&a.RetentionDays, &a.SizeBytes, &a.PushedAt); err != nil {

@@ -39,6 +39,22 @@ var (
 	ErrInvalidInput = errors.New("invalid artifact input")
 )
 
+// trimmedName is the one repository/tag rule both entries share: the decoded
+// value loses its leading and trailing Unicode whitespace and must stay
+// non-empty; interior characters and case are preserved. ok is false when the
+// value held nothing but whitespace.
+func trimmedName(value string) (trimmed string, ok bool) {
+	trimmed = strings.TrimSpace(value)
+	return trimmed, trimmed != ""
+}
+
+// validDigest is the one digest rule both entries share: the decoded value is
+// matched untrimmed against the anchored format, so an edge space keeps it
+// outside the format.
+func validDigest(value string) bool {
+	return digestPattern.MatchString(value)
+}
+
 // ParseRegistration reads exactly one JSON object from r and validates every
 // required field into a service.RegisterInput. Unknown fields are ignored;
 // key names are case sensitive and matched after JSON \u-escaping is
@@ -47,11 +63,11 @@ var (
 // non-whitespace content or read failure all return ErrInvalidInput and a
 // zero service.RegisterInput.
 //
-// Repository and tag are trimmed after decoding and must stay non-empty; the
-// digest is never trimmed and must match the anchored format; retention days
-// stay within the published range; a negative size is rejected. JSON
-// numbers decode directly into int64 — fractional, exponential and string
-// forms are rejected, while false and a zero size stay legal.
+// Repository and tag follow the shared trimmedName rule; the digest follows
+// the shared validDigest rule; retention days stay within the published
+// range; a negative size is rejected. JSON numbers decode directly into
+// int64 — fractional, exponential and string forms are rejected, while false
+// and a zero size stay legal.
 func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if r == nil {
 		return service.RegisterInput{}, ErrInvalidInput
@@ -71,7 +87,8 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if in.Repository = strings.TrimSpace(repository); in.Repository == "" {
+	var ok bool
+	if in.Repository, ok = trimmedName(repository); !ok {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 
@@ -79,7 +96,7 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if in.Tag = strings.TrimSpace(tag); in.Tag == "" {
+	if in.Tag, ok = trimmedName(tag); !ok {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 
@@ -87,7 +104,7 @@ func ParseRegistration(r io.Reader) (service.RegisterInput, error) {
 	if err != nil {
 		return service.RegisterInput{}, err
 	}
-	if !digestPattern.MatchString(digest) {
+	if !validDigest(digest) {
 		return service.RegisterInput{}, ErrInvalidInput
 	}
 	in.Digest = digest
@@ -168,8 +185,8 @@ func requiredInt(raw map[string]json.RawMessage, name string) (int64, error) {
 // query mode.
 //
 // '+' decodes to a space and '%2B' to a literal plus. Repository and tag
-// are trimmed after decoding; the digest is matched untrimmed against the
-// anchored format. A missing or blank repository, a present-but-empty tag
+// follow the shared trimmedName rule; the digest follows the shared
+// validDigest rule. A missing or blank repository, a present-but-empty tag
 // or digest, an ill-formed digest, or both selectors present together all
 // return ErrInvalidInput and a zero service.Query.
 func ParseQuery(rawQuery string) (service.Query, error) {
@@ -179,12 +196,13 @@ func ParseQuery(rawQuery string) (service.Query, error) {
 	// simply absent from the map the same way unknown parameters are.
 	values, _ := url.ParseQuery(rawQuery)
 
-	repository := strings.TrimSpace(values.Get("repository"))
+	repository, repositoryOK := trimmedName(values.Get("repository"))
 	tagValues, hasTag := values["tag"]
 	digestValues, hasDigest := values["digest"]
 	tag := ""
+	tagOK := true
 	if hasTag {
-		tag = strings.TrimSpace(tagValues[0])
+		tag, tagOK = trimmedName(tagValues[0])
 	}
 	// The digest is the first decoded value, untrimmed: an encoded edge
 	// space must keep it outside the anchored format.
@@ -193,8 +211,8 @@ func ParseQuery(rawQuery string) (service.Query, error) {
 		digest = digestValues[0]
 	}
 
-	if repository == "" || (hasTag && hasDigest) ||
-		(hasTag && tag == "") || (hasDigest && !digestPattern.MatchString(digest)) {
+	if !repositoryOK || (hasTag && hasDigest) ||
+		!tagOK || (hasDigest && !validDigest(digest)) {
 		return service.Query{}, ErrInvalidInput
 	}
 
